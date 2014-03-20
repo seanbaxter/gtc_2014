@@ -7,6 +7,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <algorithm>
+
+enum SearchBounds {
+	SearchBoundsLower,
+	SearchBoundsUpper
+};
 
 #define DEVICE __forceinline__ __device__
 
@@ -111,13 +117,13 @@ struct CTAScan {
 ////////////////////////////////////////////////////////////////////////////////
 
 template<typename T, typename It>
-DEVICE int BinarySearch(It data, int count, T key, bool upperBound = false) {
+DEVICE int BinarySearch(It data, int count, T key, SearchBounds bounds) {
 	int begin = 0;
 	int end = count;
 	while(begin < end) {
 		int mid = (begin + end) / 2;
 		T key2 = data[mid];
-		bool pred = upperBounds ? !(key < key2) : (key2 < key);
+		bool pred = (SearchBoundsUpper == bounds) ? !(key < key2) : (key2 < key);
 		if(pred) begin = mid + 1;
 		else end = mid;
 	}
@@ -126,7 +132,7 @@ DEVICE int BinarySearch(It data, int count, T key, bool upperBound = false) {
 
 template<typename It1, typename It2>
 DEVICE int MergePath(It1 a, int aCount, It2 b, int bCount, int diag,
-	bool upperBound = false) {
+	SearchBounds bounds) {
 
 	typedef typename std::iterator_traits<It1>::value_type T;
 	int begin = max(0, diag - bCount);
@@ -136,7 +142,7 @@ DEVICE int MergePath(It1 a, int aCount, It2 b, int bCount, int diag,
 		int mid = (begin + end)>> 1;
 		T aKey = a[mid];
 		T bKey = b[diag - 1 - mid];
-		bool pred = upperBound ? 
+		bool pred = (SearchBoundsUpper == bounds) ? 
 			(aKey < bKey) : !(bKey < aKey);
 		if(pred) begin = mid + 1;
 		else end = mid;

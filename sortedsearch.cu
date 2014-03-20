@@ -3,9 +3,11 @@
 
 #include "common.cuh"
 
+// Search from needles A into haystack B. Returns lower- or upper-bound indices
+// for all A needles.
 template<int NT, int VT, typename T>
-__global__ void KernelMergeSimple(const T* a_global, int aCount,
-	const T* b_global, int bCount, T* merged_global) {
+__global__ void KernelSortedSearchSimple(const T* a_global, int aCount,
+	const T* b_global, int bCount, int* indices_global, SearchBounds bounds) {
 
 	const int NV = NT * VT;
 	__shared__ T data_shared[NT * VT + 1];
@@ -32,11 +34,15 @@ __global__ void KernelMergeSimple(const T* a_global, int aCount,
 	// Each thread searches for its Merge Path partition.
 	int diag = VT * tid;
 	int mp = MergePath(data_shared, aCount, data_shared + aCount, bCount,
-		diag, SearchBoundsLower);
+		diag, bounds);
 
 	// Sequentially merge into register starting from the partition.
 	int a = mp;
 	int b = aCount + diag - a;
+	int aStart = a;
+
+	int indices[VT];
+	int decisions = 0;
 
 	#pragma unroll
 	for(int i = 0; i < VT; ++i) {
@@ -45,21 +51,31 @@ __global__ void KernelMergeSimple(const T* a_global, int aCount,
 		else if(a >= aCount) p = false;
 		else p = !(data_shared[b] < data_shared[a]);
 		
-		x[i] = p ? data_shared[a++] : data_shared[b++];
+		if(p) {
+			// aKey is smaller than bKey. Save bKey's index as the result of 
+			// the search and advance to the next needle A.
+			indices[i] = b - aCount;
+			decisions |= 1<< i;
+			++a;
+		} else {
+			// bKey is smaller than aKey. Advance to the next b.
+			++b;
+		}
 	}
 	__syncthreads();
 
-	// The merged data is now in thread order in register. Transpose through
-	// shared memory and store to DRAM.
+	// Compact the indices to shared memory.
 	#pragma unroll
 	for(int i = 0; i < VT; ++i)
-		data_shared[VT * tid + i] = x[i];
+		if((1<< i) & decisions)
+			data_shared[aStart++] = indices[i];
 	__syncthreads();
 
-	#pragma unroll
-	for(int i = 0; i < VT; ++i)
-		merged_global[NT * i + tid] = data_shared[NT * i + tid];
+	// Store all aCount indices to global memory.
+	for(int i = tid; i < aCount; i += NT)
+		indices_global[i] = data_shared[i];
 }
+
 
 int main(int argc, char** argv) {
 
@@ -67,8 +83,8 @@ int main(int argc, char** argv) {
 	const int VT = 7;
 	const int NV = NT * VT;
 
-	int aCount = NV / 2;
-	int bCount = NV - aCount;
+	int aCount = NV / 7;
+	int bCount = NV - aCountA;
 
 	// Generate random sorted arrays to merge.
 	std::vector<int> aHost(aCount), bHost(bCount);
@@ -84,24 +100,34 @@ int main(int argc, char** argv) {
 	cudaMalloc2(&a_global, aHost);
 	cudaMalloc2(&b_global, bHost);
 
-	int* merged_global;
-	cudaMalloc2(&merged_global, NV);
+	int* indices_global;
+	cudaMalloc2(&indices_global, aCount);
 
-	KernelMergeSimple<NT, VT><<<1, NT>>>(a_global, aCount, b_global, bCount,
-		merged_global);
+	KernelSortedSearchSimple<NT, VT><<<1, NT>>>(a_global, aCount, b_global, 
+		bCount, indices_global, SearchBoundsLower);
 
-	std::vector<int> mergedHost(NV);
-	copyDtoH(&mergedHost[0], merged_global, NV);
+	std::vector<int> indicesHost(aCount);
+	copyDtoH(&indicesHost[0], indices_global, aCount);
 
 	cudaFree(a_global);
 	cudaFree(b_global);
-	cudaFree(merged_global);
+	cudaFree(indices_global);
 
-	for(int tid = 0; tid < NT; ++tid) {
-		printf("%3d: \t", tid);
+	for(int a = 0; a < aCount; ++a) {
+		printf("Key %3d  index %3d\n", aHost[a], indicesHost[a]);
 
-		for(int i = 0; i < VT; ++i)
-			printf("%3d ", mergedHost[VT * tid + i]);
+		// Print all the keys behind it.
+		int begin = indicesHost[a];
+		int end = (a + 1 < aCount) ? indicesHost[a + 1] : bCount;
+		int count = end - begin;
+
+		for(int i = 0; i < count; ++i) {
+			if(0 == (i % 5)) {
+				if(i) printf("\n");
+				printf("\t%3d: ", begin + i);
+			}
+			printf("%3d  ", bHost[begin + i]);
+		}
 		printf("\n");
 	}
 	return 0;
