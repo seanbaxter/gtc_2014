@@ -95,8 +95,6 @@ void GenCSRArray(int aCount, int bCount, std::vector<int>& csr) {
 
 int main(int argc, char** argv) {
 
-	srand(time(0));
-
 	const int NT = 128;
 	const int VT = 7;
 	const int NV = NT * VT;
