@@ -7,27 +7,24 @@
 // for all A needles.
 template<int NT, int VT>
 __global__ void KernelLBSSimple(int aCount, const int* b_global, int bCount,
-	int* indices_global, SearchBounds bounds) {
+	int* indices_global) {
 
-	const int NV = NT * VT;
-	__shared__ int data_shared[NT * VT + 1];
+	__shared__ int data_shared[NT * VT];
 
 	int tid = threadIdx.x;
 
-	// Load bCount elements from B.
-	T x[VT];
+	// Load bCount elements from B into data_shared.
+	int x[VT];
 	#pragma unroll
 	for(int i = 0; i < VT; ++i) {
 		int index = NT * i + tid;
 		if(index < bCount) x[i] = b_global[index];
 	}
 	
-	// Store all elements to shared memory.
 	#pragma unroll
 	for(int i = 0; i < VT; ++i)
 		data_shared[NT * i + tid] = x[i];
 	__syncthreads();
-
 
 	// Each thread searches for its Merge Path partition.
 	int diag = VT * tid;
@@ -38,106 +35,108 @@ __global__ void KernelLBSSimple(int aCount, const int* b_global, int bCount,
 		int mid = (begin + end)>> 1;
 		int aKey = mid;
 		int bKey = data_shared[diag - 1 - mid];
-		bool pred = !(aKey < bKey);
+		bool pred = aKey < bKey;
 		if(pred) begin = mid + 1;
 		else end = mid;
 	}
 	int mp = begin;
 
-
-	// Sequentially merge into register starting from the partition.
+	// Sequentially search, comparing indices a to elements data_shared[b].
+	// Store indices for A in the right-side of the shared memory array.
+	// This lets us complete the search in just a single pass, rather than 
+	// the search and compact passes of the generalized vectorized sorted
+	// search function.
 	int a = mp;
-	int b = aCount + diag - a;
-	int aStart = a;
-
-	int indices[VT];
-	int decisions = 0;
-
+	int b = diag - a;
+	
 	#pragma unroll
 	for(int i = 0; i < VT; ++i) {
 		bool p;
-		if(b >= NV) p = true;
+		if(b >= bCount) p = true;
 		else if(a >= aCount) p = false;
-		else p = !(data_shared[b] < data_shared[a]);
+		else p = a < data_shared[b];
 		
-		if(p) {
-			// aKey is smaller than bKey. Save bKey's index as the result of 
-			// the search and advance to the next needle A.
-			indices[i] = b - aCount;
-			decisions |= 1<< i;
-			++a;
-		} else {
-			// bKey is smaller than aKey. Advance to the next b.
+		if(p)
+			// If a < data_shared[b], advance A and store the index b - 1.
+			data_shared[bCount + a++] = b - 1;
+		else
+			// Just advance b.
 			++b;
-		}
 	}
 	__syncthreads();
 
-	// Compact the indices to shared memory.
-	#pragma unroll
-	for(int i = 0; i < VT; ++i)
-		if((1<< i) & decisions)
-			data_shared[aStart++] = indices[i];
-	__syncthreads();
-
-	// Store all aCount indices to global memory.
+	// Store all indices to global memory.
 	for(int i = tid; i < aCount; i += NT)
-		indices_global[i] = data_shared[i];
+		indices_global[i] = data_shared[bCount + i];
 }
 
+// Generate a CSR array by recursively bisecting and setting a random value.
+void GenCSRArrayRecurse(int* csr, int begin, int end, int left, int right) {
+	int mid = (begin + end) / 2;
+	int val;
+	if(right - left > 10)
+		val = (left + right - 10) / 2 + (rand() % 10);
+	else
+		val = left + (rand() % (right - left + 1));
+
+	csr[mid] = val;
+	if(mid > begin) GenCSRArrayRecurse(csr, begin, mid, left, val);
+	if(mid + 1 < end) GenCSRArrayRecurse(csr, mid + 1, end, val, right);
+}
+
+void GenCSRArray(int aCount, int bCount, std::vector<int>& csr) {
+	csr.resize(bCount + 1);
+	csr[0] = 0;
+	csr[bCount] = aCount;
+	GenCSRArrayRecurse(&csr[0], 1, bCount, 0, aCount);
+	
+	csr.resize(bCount);
+}
 
 int main(int argc, char** argv) {
+
+	srand(time(0));
 
 	const int NT = 128;
 	const int VT = 7;
 	const int NV = NT * VT;
 
-	int aCount = NV / 7;
-	int bCount = NV - aCountA;
+	int bCount = NV / 7;
+	int aCount = NV - bCount;
 
-	// Generate random sorted arrays to merge.
-	std::vector<int> aHost(aCount), bHost(bCount);
-	for(int i = 0; i < aCount; ++i)
-		aHost[i] = rand() % 100;
-	for(int i = 0; i < bCount; ++i)
-		bHost[i] = rand() % 100;
+	// Generate the CSR array.
+	std::vector<int> csrHost;
+	GenCSRArray(aCount, bCount, csrHost);
 
-	std::sort(aHost.begin(), aHost.end());
-	std::sort(bHost.begin(), bHost.end());
-
+	// Allocate GPU device memory.
 	int* a_global, *b_global;
-	cudaMalloc2(&a_global, aHost);
-	cudaMalloc2(&b_global, bHost);
+	cudaMalloc2(&a_global, aCount);
+	cudaMalloc2(&b_global, csrHost);
 
-	int* indices_global;
-	cudaMalloc2(&indices_global, aCount);
+	// Run the CTA-wide LBS.
+	KernelLBSSimple<NT, VT><<<1, NT>>>(aCount, b_global, bCount, a_global);
 
-	KernelSortedSearchSimple<NT, VT><<<1, NT>>>(a_global, aCount, b_global, 
-		bCount, indices_global, SearchBoundsLower);
-
-	std::vector<int> indicesHost(aCount);
-	copyDtoH(&indicesHost[0], indices_global, aCount);
+	// Retrieve the COO array.
+	std::vector<int> cooHost(aCount);
+	copyDtoH(&cooHost[0], a_global, aCount);
 
 	cudaFree(a_global);
 	cudaFree(b_global);
-	cudaFree(indices_global);
 
-	for(int a = 0; a < aCount; ++a) {
-		printf("Key %3d  index %3d\n", aHost[a], indicesHost[a]);
+	// Print both arrays.
+	for(int b = 0; b < bCount; ++b) {
+		printf("%3d (%3d):", b, csrHost[b]);
 
-		// Print all the keys behind it.
-		int begin = indicesHost[a];
-		int end = (a + 1 < aCount) ? indicesHost[a + 1] : bCount;
+		int begin = csrHost[b];
+		int end = (b + 1 < bCount) ? csrHost[b + 1] : aCount;
 		int count = end - begin;
-
+		
 		for(int i = 0; i < count; ++i) {
-			if(0 == (i % 5)) {
-				if(i) printf("\n");
-				printf("\t%3d: ", begin + i);
-			}
-			printf("%3d  ", bHost[begin + i]);
+			if(0 == (i % 5)) printf("\n  %3d: \t", begin + i);
+			printf("%3d  ", cooHost[begin + i]);
 		}
-		printf("\n");
+		printf("\n\n");
 	}
+
 	return 0;
 }

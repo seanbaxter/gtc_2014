@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
 	const int NV = NT * VT;
 
 	int aCount = NV / 7;
-	int bCount = NV - aCountA;
+	int bCount = NV - aCount;
 
 	// Generate random sorted arrays to merge.
 	std::vector<int> aHost(aCount), bHost(bCount);
@@ -114,7 +114,7 @@ int main(int argc, char** argv) {
 	cudaFree(indices_global);
 
 	for(int a = 0; a < aCount; ++a) {
-		printf("Key %3d  index %3d\n", aHost[a], indicesHost[a]);
+		printf("Key %3d  index %3d", aHost[a], indicesHost[a]);
 
 		// Print all the keys behind it.
 		int begin = indicesHost[a];
@@ -122,13 +122,10 @@ int main(int argc, char** argv) {
 		int count = end - begin;
 
 		for(int i = 0; i < count; ++i) {
-			if(0 == (i % 5)) {
-				if(i) printf("\n");
-				printf("\t%3d: ", begin + i);
-			}
+			if(0 == (i % 5)) printf("\n\t%3d: ", begin + i);
 			printf("%3d  ", bHost[begin + i]);
 		}
-		printf("\n");
+		printf("\n\n");
 	}
 	return 0;
 }
